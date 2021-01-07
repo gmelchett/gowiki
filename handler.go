@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"gowiki/static"
 	"html/template"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -9,14 +12,65 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/Paspartout/gowiki/static"
+	"github.com/gomarkdown/markdown"
+	"github.com/gomarkdown/markdown/ast"
+	"github.com/gomarkdown/markdown/html"
+	"github.com/gomarkdown/markdown/parser"
 	"github.com/microcosm-cc/bluemonday"
-	blackfriday "gopkg.in/russross/blackfriday.v2"
 )
 
 var validTitle = regexp.MustCompile(`^([a-zA-Z0-9]+)$`)
 var validPath = regexp.MustCompile(`^/(((view|delete)/([a-zA-Z0-9]+))|((edit|save)/([a-zA-Z0-9]*)))$`)
 var linkRegex = regexp.MustCompile(`\[([a-zA-Z0-9]+)\]`)
+var langTags = regexp.MustCompile("^language-[a-zA-Z0-9]+$")
+var colorTags = regexp.MustCompile("^has-text-[a-zA-Z0-9-]+$")
+
+const mdExt parser.Extensions = parser.Tables | parser.FencedCode |
+	parser.Autolink | parser.Strikethrough | parser.SpaceHeadings |
+	parser.NoEmptyLineBeforeBlock | parser.HeadingIDs | parser.AutoHeadingIDs |
+	parser.BackslashLineBreak | parser.DefinitionLists | parser.MathJax |
+	parser.SuperSubscript | parser.Footnotes
+
+func insertLinks(w io.Writer, node ast.Node, entering bool) (ast.WalkStatus, bool) {
+
+	if _, ok := node.(*ast.Text); !ok {
+		return ast.GoToNext, false
+	}
+
+	// Interlinking
+	withLinks := linkRegex.ReplaceAllFunc(node.AsLeaf().Literal,
+		func(link []byte) []byte {
+			linkTitle := string(link)
+			linkTitle = linkTitle[1 : len(linkTitle)-1]
+
+			linkStr := "<a href=\"" + linkTitle + "\">"
+
+			if exists(linkTitle) {
+				linkStr += linkTitle
+			} else {
+				linkStr += "<span class=\"has-text-danger\">" + linkTitle + " <sup>(No such page)</sup></span>"
+			}
+
+			linkStr += "</a>"
+			return []byte(linkStr)
+		})
+
+	w.Write(withLinks)
+
+	return ast.GoToNext, true
+}
+
+func renderMarkdown(content []byte) []byte {
+	// carriage returns (ASCII 13) are messing things up
+	content = bytes.Replace(content, []byte{13}, []byte{}, -1)
+	opts := html.RendererOptions{
+		Flags:          html.CommonFlags,
+		RenderNodeHook: insertLinks,
+	}
+
+	content = markdown.ToHTML(content, parser.NewWithExtensions(mdExt), html.NewRenderer(opts))
+	return content
+}
 
 func viewHandler(w http.ResponseWriter, r *http.Request, title string) {
 	p, err := loadPage(title)
@@ -25,19 +79,13 @@ func viewHandler(w http.ResponseWriter, r *http.Request, title string) {
 		return
 	}
 
-	// Markdown rendering
-	bodyRendered := blackfriday.Run(p.Body)
-	// Sanitize html
-	bodyRendered = bluemonday.UGCPolicy().SanitizeBytes(bodyRendered)
+	bodyRendered := renderMarkdown(p.Body)
 
-	// Interlinking
-	bodyRendered = linkRegex.ReplaceAllFunc(bodyRendered,
-		func(link []byte) []byte {
-			linkTitle := string(link)
-			linkTitle = linkTitle[1 : len(linkTitle)-1]
-			linkStr := "<a href=\"" + linkTitle + "\">" + linkTitle + "</a>"
-			return []byte(linkStr)
-		})
+	// Filter output html
+	bm := bluemonday.UGCPolicy()
+	bm.AllowAttrs("class").Matching(langTags).OnElements("code")  // language tags
+	bm.AllowAttrs("class").Matching(colorTags).OnElements("span") // span color selection
+	bodyRendered = bm.SanitizeBytes(bodyRendered)
 
 	renderedPage := &RenderedPage{
 		Title: p.Title,

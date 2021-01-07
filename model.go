@@ -72,3 +72,13 @@ func loadPage(title string) (*Page, error) {
 	}
 	return &Page{Title: title, Body: body}, nil
 }
+
+func exists(title string) bool {
+	filename := dataPath + title + extension
+	_, err := os.Stat(filename)
+	if os.IsNotExist(err) {
+		return false
+	} else {
+		return true
+	}
+}

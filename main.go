@@ -4,14 +4,13 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
-	"gowiki/static"
-	"gowiki/tmpl"
 	"html/template"
 	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -22,56 +21,65 @@ import (
 	"github.com/microcosm-cc/bluemonday"
 )
 
-// Config stores the configuration for the wiki that is parsed
-// from the command line
-type Config struct {
-	Address  string // Adress to bind to
-	DataPath string // Path to md files
-	UseLocal bool   // True if user wants to use local static files e.g. for development
+const (
+	LOCAL_TEMPLATE_PATH = "./tmpl/"
+	LOCAL_STATIC_PATH   = "./static/"
+	LOCAL_DATA_PATH     = "./data/"
+)
+
+const (
+	VIEW_PATH   = "/view/"
+	SAVE_PATH   = "/save/"
+	DELETE_PATH = "/delete/"
+	EDIT_PATH   = "/edit/"
+	PAGES_PATH  = "/pages/"
+	STATIC_PATH = "/static/"
+)
+
+type joki struct {
+	dataPath  string
+	templates map[string]*template.Template
+	wikiName  string
 }
 
 const (
 	extension      = ".md"
-	staticPath     = "static/"
-	frontPageTitle = "FrontPage"
+	frontPageTitle = "Home"
 )
-
-var dataPath = "data/"
 
 // Page represents a page of the wiki
 type Page struct {
-	Title string
-	Body  []byte
+	fileName string // not part of the viewed page
+	Title    string
+	Body     []byte
+	WikiName string
 }
 
 // RenderedPage represents a page that has been rendered to html
 type RenderedPage struct {
-	Title string
-	Body  template.HTML
+	Title    string
+	Body     template.HTML
+	WikiName string
 }
 
 func (p *Page) save() error {
-	filename := dataPath + p.Title + extension
-	err := ioutil.WriteFile(filename, p.Body, 0600)
+	err := ioutil.WriteFile(p.fileName, p.Body, 0600)
 	_, isPerr := err.(*os.PathError)
 	if err != nil && isPerr {
 		// Try to fix path error by making dataPath directory
-		err = os.Mkdir(dataPath, 0700)
+		err = os.Mkdir(filepath.Dir(p.fileName), 0700)
 		if err != nil {
 			return err
 		}
-		log.Printf("Creating %s directory for pages", dataPath)
+		log.Printf("Creating %s directory for pages", filepath.Dir(p.fileName))
 		return p.save()
-	} else if err != nil {
-		return err
 	}
-	return nil
+	return err
 }
 
 // Removes a page
 func (p *Page) remove() error {
-	filename := dataPath + p.Title + extension
-	return os.Remove(filename)
+	return os.Remove(p.fileName)
 }
 
 // Renames the page to the new title
@@ -80,69 +88,55 @@ func (p *Page) rename(newTitle string) error {
 		return fmt.Errorf("new title \"%s\" is invalid", newTitle)
 	}
 
-	filename := dataPath + p.Title + extension
-	newFileanme := dataPath + newTitle + extension
-	err := os.Rename(filename, newFileanme)
-	if err != nil {
+	newFileName := filepath.Dir(p.fileName) + newTitle + extension
+	if err := os.Rename(p.fileName, newFileName); err == nil {
+		p.Title = newTitle
+		p.fileName = newFileName
+		return nil
+	} else {
 		return err
 	}
-
-	p.Title = newTitle
-	return nil
 }
 
 // Loads a page using its title
-func loadPage(title string) (*Page, error) {
-	filename := dataPath + title + extension
-	body, err := ioutil.ReadFile(filename)
+func (joki *joki) loadPage(title string) (*Page, error) {
+	fileName := joki.dataPath + title + extension
+	body, err := ioutil.ReadFile(fileName)
 	if err != nil {
 		return nil, err
 	}
-	return &Page{Title: title, Body: body}, nil
+	return &Page{Title: title, Body: body, fileName: fileName}, nil
 }
 
-func exists(title string) bool {
-	filename := dataPath + title + extension
+func (joki *joki) newPage(title string) *Page {
+	return &Page{fileName: joki.dataPath + title + extension, Title: title}
+}
+
+func (joki *joki) exists(title string) bool {
+	filename := joki.dataPath + title + extension
 	_, err := os.Stat(filename)
-	if os.IsNotExist(err) {
-		return false
-	} else {
-		return true
-	}
+	return !os.IsNotExist(err)
 }
 
-var templateMap map[string]*template.Template
-
-func initTemplates(useLocal bool) error {
+func (joki *joki) initTemplates() {
 	const (
-		templatePath   = "/tmpl/"
-		templateBase   = "/tmpl/layout/base.html"
+		templatePath   = "tmpl/"
+		templateBase   = "tmpl/layout/base.html"
 		templateEnding = ".html"
 	)
 	templates := []string{"view", "edit", "delete", "new", "pages"}
 
-	templateMap = make(map[string]*template.Template)
 	for _, tpl := range templates {
-		newTmpl := template.New(tpl + templateEnding)
-		// First load base template
-		_, err := newTmpl.Parse(tmpl.FSMustString(useLocal, templateBase))
+		var err error
+		joki.templates[tpl], err = template.New(tpl+templateEnding).ParseFiles(templateBase, templatePath+tpl+templateEnding)
 		if err != nil {
-			return err
+			log.Fatal("Error loading template:", tpl, err)
 		}
-		// Then add the specific one over it
-		_, err = newTmpl.Parse(tmpl.FSMustString(useLocal, templatePath+tpl+templateEnding))
-		if err != nil {
-			return err
-		}
-
-		templateMap[tpl] = newTmpl
 	}
-
-	return nil
 }
 
-func renderTemplate(w http.ResponseWriter, tmpl string, p interface{}) {
-	err := templateMap[tmpl].ExecuteTemplate(w, tmpl+".html", p)
+func (joki *joki) renderTemplate(w http.ResponseWriter, tmpl string, p interface{}) {
+	err := joki.templates[tmpl].ExecuteTemplate(w, tmpl+".html", p)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
@@ -160,7 +154,7 @@ const mdExt parser.Extensions = parser.Tables | parser.FencedCode |
 	parser.BackslashLineBreak | parser.DefinitionLists | parser.MathJax |
 	parser.SuperSubscript | parser.Footnotes
 
-func insertLinks(w io.Writer, node ast.Node, entering bool) (ast.WalkStatus, bool) {
+func (joki *joki) insertLinks(w io.Writer, node ast.Node, entering bool) (ast.WalkStatus, bool) {
 
 	if _, ok := node.(*ast.Text); !ok {
 		return ast.GoToNext, false
@@ -174,7 +168,7 @@ func insertLinks(w io.Writer, node ast.Node, entering bool) (ast.WalkStatus, boo
 
 			linkStr := "<a href=\"" + linkTitle + "\">"
 
-			if exists(linkTitle) {
+			if joki.exists(linkTitle) {
 				linkStr += linkTitle
 			} else {
 				linkStr += "<span class=\"has-text-danger\">" + linkTitle + " <sup>(No such page)</sup></span>"
@@ -189,26 +183,25 @@ func insertLinks(w io.Writer, node ast.Node, entering bool) (ast.WalkStatus, boo
 	return ast.GoToNext, true
 }
 
-func renderMarkdown(content []byte) []byte {
+func (joki *joki) renderMarkdown(content []byte) []byte {
 	// carriage returns (ASCII 13) are messing things up
 	content = bytes.Replace(content, []byte{13}, []byte{}, -1)
 	opts := html.RendererOptions{
 		Flags:          html.CommonFlags,
-		RenderNodeHook: insertLinks,
+		RenderNodeHook: joki.insertLinks,
 	}
 
-	content = markdown.ToHTML(content, parser.NewWithExtensions(mdExt), html.NewRenderer(opts))
-	return content
+	return markdown.ToHTML(content, parser.NewWithExtensions(mdExt), html.NewRenderer(opts))
 }
 
-func viewHandler(w http.ResponseWriter, r *http.Request, title string) {
-	p, err := loadPage(title)
+func (joki *joki) viewHandler(w http.ResponseWriter, r *http.Request, title string) {
+	p, err := joki.loadPage(title)
 	if err != nil {
-		http.Redirect(w, r, "/edit/"+title, http.StatusFound)
+		http.Redirect(w, r, EDIT_PATH+title, http.StatusFound)
 		return
 	}
 
-	bodyRendered := renderMarkdown(p.Body)
+	bodyRendered := joki.renderMarkdown(p.Body)
 
 	// Filter output html
 	bm := bluemonday.UGCPolicy()
@@ -220,24 +213,24 @@ func viewHandler(w http.ResponseWriter, r *http.Request, title string) {
 		Title: p.Title,
 		Body:  template.HTML(bodyRendered)}
 
-	renderTemplate(w, "view", renderedPage)
+	joki.renderTemplate(w, "view", renderedPage)
 }
 
 // Handles editing pages or creating a new page
-func editHandler(w http.ResponseWriter, r *http.Request, title string) {
-	p, err := loadPage(title)
+func (joki *joki) editHandler(w http.ResponseWriter, r *http.Request, title string) {
+	p, err := joki.loadPage(title)
 	if err != nil && os.IsNotExist(err) {
-		renderTemplate(w, "new", title)
+		joki.renderTemplate(w, "new", title)
 		return
 	} else if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	renderTemplate(w, "edit", p)
+	joki.renderTemplate(w, "edit", p)
 }
 
 // Handles saving and moving pages
-func saveHandler(w http.ResponseWriter, r *http.Request, title string) {
+func (joki *joki) saveHandler(w http.ResponseWriter, r *http.Request, title string) {
 	body := strings.Replace(r.FormValue("body"), "\r", "", -1)
 	newTitle := r.FormValue("title")
 	if title == "" {
@@ -251,7 +244,8 @@ func saveHandler(w http.ResponseWriter, r *http.Request, title string) {
 	}
 
 	// Create or Overwrite page
-	p := &Page{Title: title, Body: []byte(body)}
+	p := joki.newPage(title)
+	p.Body = []byte(body)
 	err := p.save()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -268,12 +262,12 @@ func saveHandler(w http.ResponseWriter, r *http.Request, title string) {
 		title = newTitle
 	}
 
-	http.Redirect(w, r, "/view/"+title, http.StatusFound)
+	http.Redirect(w, r, VIEW_PATH+title, http.StatusFound)
 }
 
-func deleteHandler(w http.ResponseWriter, r *http.Request, title string) {
+func (joki *joki) deleteHandler(w http.ResponseWriter, r *http.Request, title string) {
 	deletionConfirmed := r.FormValue("Confirmed") == "True"
-	p := Page{Title: title}
+	p := joki.newPage(title)
 
 	if deletionConfirmed {
 		err := p.remove()
@@ -281,13 +275,13 @@ func deleteHandler(w http.ResponseWriter, r *http.Request, title string) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		http.Redirect(w, r, "/view/"+frontPageTitle, http.StatusFound)
+		http.Redirect(w, r, VIEW_PATH+frontPageTitle, http.StatusFound)
 	} else {
-		renderTemplate(w, "delete", p)
+		joki.renderTemplate(w, "delete", p)
 	}
 }
 
-func makeHandler(fn func(http.ResponseWriter, *http.Request, string)) http.HandlerFunc {
+func (joki *joki) makeHandler(fn func(http.ResponseWriter, *http.Request, string)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		m := validPath.FindStringSubmatch(r.URL.Path)
 		// log.Printf("%#v\n", m)
@@ -303,8 +297,8 @@ func makeHandler(fn func(http.ResponseWriter, *http.Request, string)) http.Handl
 	}
 }
 
-func pagesHandler(w http.ResponseWriter, r *http.Request) {
-	dataFiles, err := ioutil.ReadDir(dataPath)
+func (joki *joki) pagesHandler(w http.ResponseWriter, r *http.Request) {
+	dataFiles, err := ioutil.ReadDir(joki.dataPath)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -315,52 +309,39 @@ func pagesHandler(w http.ResponseWriter, r *http.Request) {
 	for _, f := range dataFiles {
 		fName := f.Name()
 		if !f.IsDir() && fName[len(fName)-3:] == extension {
-			pages = append(pages, fName[:len(fName)-3])
+			pages = append(pages, fName[:len(fName)-len(extension)])
 		}
 	}
 
-	renderTemplate(w, "pages", pages)
-}
-
-func listen(conf Config) error {
-	// TODO: Refactor model
-	dataPath = conf.DataPath
-
-	err := initTemplates(conf.UseLocal)
-	if err != nil {
-		log.Fatal("error initializing templates:", err)
-	}
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/view/"+frontPageTitle, http.StatusFound)
-	})
-
-	// Operations on pages
-	http.HandleFunc("/view/", makeHandler(viewHandler))
-	http.HandleFunc("/save/", makeHandler(saveHandler))
-	http.HandleFunc("/delete/", makeHandler(deleteHandler))
-	http.HandleFunc("/edit/", makeHandler(editHandler))
-
-	// View list of all pages
-	http.HandleFunc("/pages", pagesHandler)
-	http.Handle("/static/",
-		http.FileServer(static.FS(conf.UseLocal)))
-
-	return http.ListenAndServe(conf.Address, nil)
-}
-
-func parseConfig() Config {
-	address := flag.String("address",
-		":8080", "The address to listen to")
-	dataPath := flag.String("path",
-		"data/", "Path to the folder that contains the document files")
-	useLocal := flag.Bool("local", false,
-		"Use local static files and templates instead of embedded ones.")
-	flag.Parse()
-	return Config{Address: *address, DataPath: *dataPath, UseLocal: *useLocal}
+	joki.renderTemplate(w, "pages", pages)
 }
 
 func main() {
-	config := parseConfig()
-	log.Fatal(listen(config))
+
+	joki := joki{
+		templates: make(map[string]*template.Template),
+	}
+
+	var address string
+
+	flag.StringVar(&address, "address", ":8080", "The address to listen to")
+	flag.StringVar(&joki.dataPath, "path", LOCAL_DATA_PATH, "Path to the folder that contains the document files")
+	flag.StringVar(&joki.wikiName, "wikiname", "JoKi", "Name of wiki")
+	flag.Parse()
+
+	joki.initTemplates()
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, VIEW_PATH+frontPageTitle, http.StatusFound)
+	})
+
+	http.HandleFunc(VIEW_PATH, joki.makeHandler(joki.viewHandler))
+	http.HandleFunc(SAVE_PATH, joki.makeHandler(joki.saveHandler))
+	http.HandleFunc(DELETE_PATH, joki.makeHandler(joki.deleteHandler))
+	http.HandleFunc(EDIT_PATH, joki.makeHandler(joki.editHandler))
+
+	http.HandleFunc(PAGES_PATH, joki.pagesHandler)
+	http.Handle(STATIC_PATH, http.StripPrefix(STATIC_PATH, http.FileServer(http.Dir(LOCAL_STATIC_PATH))))
+
+	http.ListenAndServe(address, nil)
 }

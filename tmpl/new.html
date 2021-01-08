@@ -1,4 +1,5 @@
 {{ template "base" . }}
+{{ define "wikiname" }} {{.WikiName}} {{ end }}
 {{ define "title" }}{{if .}} Create {{.}} {{else}} Create a new page {{end}}{{ end }}
 {{ define "content" }}
 <div class="card">
